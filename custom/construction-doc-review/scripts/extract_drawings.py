@@ -9,18 +9,24 @@
 출력(JSON):
     {"source_files": [...],
      "pages": [{file, page, dwg_no, title, scale, scale_norm, rev, is_list, scanned,
-                spec_tokens:[{cat, token, raw}], title_text_raw}],
+                rev_suffix?, title_region, spec_tokens:[{cat, token, raw}], title_text_raw}],
      "drawing_list": [{file, page, no, dwg_no, title, scale, scale_norm, rev, raw}],
      "warnings": [...]}
 
 주의:
-- 표제란은 기본적으로 페이지 우하단(가로 60~100%, 세로 75~100%)으로 가정한다.
-  도면 양식이 다르면 --title-region 으로 조정한다(좌상단 원점, 비율 값).
+- 표제란은 기본적으로 페이지 우하단(가로 60~100%, 세로 75~100%)으로 가정한다(--title-region 으로 변경).
+  이 영역에서 '도면번호' 라벨을 못 찾으면 우상단·좌하단·좌상단·우측 띠·하단 띠·좌측 띠·상단 띠,
+  마지막으로 페이지 전체 순으로 재시도하고, 어느 영역을 썼는지 경고에 남긴다(pages[].title_region).
+- 도면번호는 라벨 옆 값·도면목록 '도면번호' 열에서 우선 읽고, 도면목록 번호를 어휘로 사용해 표제란과 맞춘다.
+  라벨이 없을 때만 본문에서 엄격 패턴(D10·SD400·GL-1500 등 규격 표기 제외)으로 추정한다.
+  S-201R1 처럼 개정 접미가 붙은 번호는 'S-201' 로 정규화하고 접미를 개정번호(rev_suffix)로 쓴다.
+- 도면목록에서 해석하지 못한 비어 있지 않은 행/칸은 버리지 않고 경고로 남긴다.
 - 텍스트가 30자 미만인 페이지는 스캔(이미지) 도면으로 보고 scanned:true 로 표시한다.
   이런 페이지는 이미지를 직접 확인해야 한다(pdftoppm 으로 렌더링).
 - 이 모듈의 extract_spec_tokens() 는 cross_check.py 에서도 재사용한다.
 """
 import argparse
+import contextlib
 import os
 import re
 import sys
@@ -39,11 +45,73 @@ from _numparse import write_json  # noqa: E402  (공용 헬퍼)
 # 정규식 정의
 # ---------------------------------------------------------------------------
 
-# 도면번호: A-101, S-201, AR-001, M-01-001, 기-01, E-1001 등
-# 앞뒤가 영숫자이면 제외(예: H-300x300 의 'H-300' 은 뒤에 'x'가 붙어 제외됨)
-DWG_NO_RE = re.compile(
-    r"(?<![0-9A-Za-z가-힣\-])((?:[A-Z]{1,3}|[가-힣]{1,2})\s?-\s?\d{1,4}(?:-\d{1,4})?[A-Z]?)(?![0-9A-Za-z\-])"
+# 도면번호: A-101, A101, E01, S-201R1, ARCH-101, A-101-01-2, 기-01, 기계설비-01 등
+#   접두: 영문 대문자 1~6자 또는 한글 1~6자, 구분: 대시(선택, 한글 접두는 필수),
+#   숫자 구간: 1~4자리 여러 개(대시 구분), 접미: 영문 1자(A-101A) 또는 개정 접미(R1, REV2).
+# 앞뒤가 영숫자·한글·대시이면 제외(예: H-300x300 은 뒤에 'x' 가 붙어 제외, 24MPa 는 숫자로 시작해 제외).
+_DWG_CORE = (
+    r"(?:[A-Z]{1,6}(?:\s?-\s?|(?=\d))|[가-힣]{1,6}\s?-\s?)"   # 접두 + 구분
+    r"\d{1,4}(?:\s?-\s?\d{1,4})*"                              # 숫자 구간
+    r"(?:-?(?:R|REV\.?)\d{1,2}|[A-Z])?"                         # 접미
 )
+_DWG_LB = (r"(?<![0-9A-Za-z가-힣\-_./])"
+           # 대시 없는 규격 표기(D10, HD13, SD400, DN100, M16, SS400, A1 용지 등)는 도면번호로 보지 않음
+           r"(?!(?:SHD|UHD|HD|SD|DN|THK|STK|SS|SM|SN|PL|D|M|T|R|W|C|L|H|I|F)\d)(?![AB][0-5](?!\d))")
+_DWG_LA = r"(?![0-9A-Za-z가-힣\-_]|\.\d|\s*[xX×*]\s*\d|/\d)"
+DWG_NO_RE = re.compile(_DWG_LB + "(" + _DWG_CORE + ")" + _DWG_LA)
+# 개정 접미 분리용
+REV_SUFFIX_RE = re.compile(r"^(.*\d)-?(?:R|REV\.?)(\d{1,2})$")
+# 라벨·목록 열 문맥이 없는 본문 텍스트에서는 규격 표기와 혼동되는 접두를 제외한다.
+# (D10, HD13, SD400, DN100, KS D 3504, A1 용지, GL-1500 레벨, M16 볼트, SS400 강종 등)
+FREE_TEXT_BAD_PREFIX = {
+    "D", "HD", "SD", "SHD", "UHD", "DN", "KS", "THK", "T", "M", "H", "I", "C", "L", "F", "W", "R",
+    "REV", "NO", "GL", "FL", "EL", "SL", "BL", "CL", "SS", "SM", "SN", "STK", "SPP", "SGP", "STS",
+    "PE", "PVC", "PP", "CV", "VV", "SQ", "MM", "CM", "KG", "TON", "EA", "MPA", "FCK", "PL", "LV",
+    "HFIX", "CD", "SEC", "QTY", "TEL", "FAX", "B",
+}
+PAPER_RE = re.compile(r"^[AB][0-5]$")
+
+
+def _dwg_prefix(tok):
+    m = re.match(r"([A-Z]+|[가-힣]+)", tok)
+    return m.group(1) if m else ""
+
+
+def find_dwg_no(text, vocab=None, strict=False):
+    """텍스트에서 도면번호 1개를 찾는다 → (정규화 번호, 개정 접미 또는 None) / (None, None).
+
+    vocab: 도면목록 번호 집합(정규화). 텍스트에 목록 번호가 있으면 그것을 우선한다.
+    strict: 라벨·목록 열 문맥이 없는 본문 텍스트일 때 True (규격 표기 접두 제외).
+    """
+    if not text:
+        return None, None
+    if vocab:
+        best = None
+        for m in DWG_NO_RE.finditer(text):
+            n, rv = split_rev_suffix(norm_dwg_no(m.group(1)))
+            if n in vocab:
+                return n, rv
+            if best is None:
+                best = (n, rv)
+        # 공백·대시 표기 차이 등으로 정규식에 안 걸리는 목록 번호 직접 탐색
+        compact = re.sub(r"\s+", "", text).upper()
+        for v in sorted(vocab, key=len, reverse=True):
+            i = compact.find(v)
+            while i >= 0:
+                before = compact[i - 1] if i > 0 else ""
+                after = compact[i + len(v)] if i + len(v) < len(compact) else ""
+                if not re.match(r"[0-9A-Z가-힣\-]", before) and not re.match(r"[0-9A-Z가-힣\-]", after):
+                    return v, None
+                i = compact.find(v, i + 1)
+    for m in DWG_NO_RE.finditer(text):
+        tok = norm_dwg_no(m.group(1))
+        if strict:
+            pre = _dwg_prefix(tok)
+            if pre in FREE_TEXT_BAD_PREFIX or PAPER_RE.match(tok):
+                continue
+        return split_rev_suffix(tok)
+    return None, None
+
 
 # 축척: 1/100, 1:100, S=1/50, A1:1/100, NONE, N.S, NTS
 SCALE_RE = re.compile(
@@ -153,6 +221,16 @@ def norm_dwg_no(s):
     return s or None
 
 
+def split_rev_suffix(no):
+    """'S-201R1' → ('S-201', '1'). 개정 접미가 없으면 (no, None)."""
+    if not no:
+        return no, None
+    m = REV_SUFFIX_RE.match(no)
+    if m:
+        return m.group(1).rstrip("-"), norm_rev(m.group(2))
+    return no, None
+
+
 def parse_scale(s):
     """축척 문자열 -> (raw, norm). norm 예: '1/100', 'A1=1/100;A3=1/200', 'NONE'."""
     if not s:
@@ -206,9 +284,14 @@ def _segments_by_label(lines):
     return segs
 
 
-def parse_title_block(text):
-    """표제란 텍스트에서 도면번호/도면명/축척/개정을 추출."""
-    res = {"dwg_no": None, "title": None, "scale": None, "scale_norm": None, "rev": None}
+def parse_title_block(text, vocab=None):
+    """표제란 텍스트에서 도면번호/도면명/축척/개정을 추출.
+
+    반환 dict 의 보조 키: _labeled(라벨 옆 값에서 도면번호를 찾음), _dwg_no_guess(라벨 없이 추정),
+    _dwg_no_unparsed(라벨 옆 값이 있으나 도면번호로 해석 못 함), rev_suffix(S-201R1 의 '1').
+    """
+    res = {"dwg_no": None, "title": None, "scale": None, "scale_norm": None, "rev": None,
+           "rev_suffix": None, "_labeled": False}
     if not text:
         return res
     lines = [l for l in text.splitlines() if l.strip()]
@@ -226,9 +309,11 @@ def parse_title_block(text):
         if not val:
             continue
         if field == "dwg_no" and not res["dwg_no"]:
-            m = DWG_NO_RE.search(val)
-            if m:
-                res["dwg_no"] = norm_dwg_no(m.group(1))
+            no, rsuf = find_dwg_no(val, vocab, strict=False)
+            if no:
+                res["dwg_no"], res["rev_suffix"], res["_labeled"] = no, rsuf, True
+            elif not res.get("_dwg_no_unparsed"):
+                res["_dwg_no_unparsed"] = val
         elif field == "title" and not res["title"]:
             res["title"] = re.sub(r"\s+", " ", val).strip()
         elif field == "scale" and not res["scale"]:
@@ -240,11 +325,11 @@ def parse_title_block(text):
             if m:
                 res["rev"] = norm_rev(m.group(1))
 
-    # 라벨 기반으로 못 찾은 경우의 대체 규칙
+    # 라벨 기반으로 못 찾은 경우의 대체 규칙(본문 혼입을 고려해 엄격 모드)
     if not res["dwg_no"]:
-        m = DWG_NO_RE.search(text)
-        if m:
-            res["dwg_no"] = norm_dwg_no(m.group(1))
+        no, rsuf = find_dwg_no(text, vocab, strict=True)
+        if no:
+            res["dwg_no"], res["rev_suffix"] = no, rsuf
             res["_dwg_no_guess"] = True
     if not res["scale_norm"]:
         raw, nrm = parse_scale(text)
@@ -260,6 +345,8 @@ def parse_title_block(text):
             if revs:
                 nums = [r for r in revs if r.isdigit()]
                 res["rev"] = str(max(int(r) for r in nums)) if nums else sorted(revs)[-1]
+    if res["rev"] is None and res["rev_suffix"] is not None:
+        res["rev"] = res["rev_suffix"]
     return res
 
 
@@ -273,6 +360,8 @@ HEADER_MAP = [
     ("scale", re.compile(r"축\s*척|SCALE", re.I)),
     ("rev", re.compile(r"개\s*정|REV", re.I)),
 ]
+# 정규식에 맞지 않아도 도면번호로 볼 만한 식별자(숫자 포함, 공백 없음)
+LOOSE_ID_RE = re.compile(r"[0-9A-Za-z가-힣\-_.]{2,24}")
 
 
 def _map_header(row):
@@ -286,47 +375,89 @@ def _map_header(row):
     return cols
 
 
-def parse_list_tables(page):
-    """pdfplumber extract_tables 로 도면목록 행을 추출."""
+def _list_dwg_no(cell, loc, raw, warnings):
+    """목록 '도면번호' 칸 → (번호, 개정 접미). 실패하면 경고 후 (None, None)."""
+    no, rsuf = find_dwg_no(cell, strict=False)
+    if no:
+        return no, rsuf
+    compact = re.sub(r"\s+", "", cell)
+    if LOOSE_ID_RE.fullmatch(compact) and re.search(r"\d", compact):
+        warnings.append("%s: 도면목록 도면번호 '%s' 가 표준 형식이 아니어서 그대로 사용 — 확인 권장 (행: %s)"
+                        % (loc, cell, raw))
+        return split_rev_suffix(norm_dwg_no(compact))
+    warnings.append("%s: 도면목록 행의 도면번호 '%s' 를 인식하지 못해 제외함 — 원본 확인 필요 (행: %s)"
+                    % (loc, cell, raw))
+    return None, None
+
+
+def parse_list_tables(page, loc="", warnings=None):
+    """pdfplumber extract_tables 로 도면목록 행을 추출. 해석 못 한 비어 있지 않은 행은 경고로 남긴다."""
+    if warnings is None:
+        warnings = []
     entries = []
     try:
         tables = page.extract_tables()
-    except Exception:
+    except Exception as e:  # noqa: BLE001
+        warnings.append("%s: 도면목록 표 추출 실패(%s: %s) — 텍스트 기반으로 재시도" % (loc, type(e).__name__, e))
         tables = []
     for tb in tables or []:
         cols = None
         for row in tb:
-            if not row:
+            if not row or not any((c or "").strip() for c in row):
+                continue
+            h = _map_header(row)
+            if "dwg_no" in h and len(h) >= 2:
+                cols = h  # 헤더(페이지·표마다 반복되는 헤더 포함)
                 continue
             if cols is None:
-                h = _map_header(row)
-                if "dwg_no" in h:
-                    cols = h
                 continue
-            cell = lambda k: ((row[cols[k]] or "").replace("\n", " ").strip() if k in cols and cols[k] < len(row) else "")
-            m = DWG_NO_RE.search(cell("dwg_no"))
-            if not m:
+
+            def cell(k):
+                return ((row[cols[k]] or "").replace("\n", " ").strip()
+                        if k in cols and cols[k] < len(row) else "")
+            raw = " | ".join((c or "").replace("\n", " ") for c in row)
+            dcell = cell("dwg_no")
+            if not dcell:
+                warnings.append("%s: 도면목록 행에 도면번호 칸이 비어 있어 제외함 — 원본 확인 필요 (행: %s)" % (loc, raw))
                 continue
-            sraw, snorm = parse_scale(cell("scale"))
+            no, rsuf = _list_dwg_no(dcell, loc, raw, warnings)
+            if not no:
+                continue
+            scell = cell("scale")
+            sraw, snorm = parse_scale(scell)
+            if scell and not snorm:
+                warnings.append("%s: 도면목록 %s 의 축척 '%s' 를 인식하지 못함 — 축척 비교 생략" % (loc, no, scell))
             rv = cell("rev")
+            rev = norm_rev(rv) if rv else rsuf
+            if rv and not re.fullmatch(r"[0-9]{1,2}|[A-Za-z]", rv.strip()):
+                warnings.append("%s: 도면목록 %s 의 개정 '%s' 가 일반 형식이 아님 — 확인 권장" % (loc, no, rv))
             entries.append({
                 "no": cell("no") or None,
-                "dwg_no": norm_dwg_no(m.group(1)),
+                "dwg_no": no,
                 "title": re.sub(r"\s+", " ", cell("title")) or None,
                 "scale": sraw, "scale_norm": snorm,
-                "rev": norm_rev(rv) if rv else None,
-                "raw": " | ".join((c or "").replace("\n", " ") for c in row),
+                "rev": rev,
+                "raw": raw,
                 "method": "table",
             })
     return entries
 
 
-def parse_list_text(text):
+ROW_LIKE_RE = re.compile(r"^\s*\d{1,4}[\s.)]+\S")
+
+
+def parse_list_text(text, loc="", warnings=None):
     """표 인식 실패 시 텍스트 줄 단위로 도면목록 추정: [번호] 도면번호 도면명 [축척] [개정]."""
+    if warnings is None:
+        warnings = []
     entries = []
     for line in (text or "").splitlines():
         m = DWG_NO_RE.search(line)
         if not m:
+            # 번호로 시작하는 행처럼 보이는데 도면번호를 못 찾으면 조용히 버리지 않는다
+            if ROW_LIKE_RE.match(line) and not ALL_LABEL_RE.search(line) and not LIST_KEYWORDS_RE.search(line):
+                warnings.append("%s: 도면목록 텍스트 행에서 도면번호를 인식하지 못해 제외함 — 원본 확인 필요 (행: %s)"
+                                % (loc, line.strip()))
             continue
         pre = line[:m.start()].strip()
         rest = line[m.end():].strip()
@@ -351,11 +482,12 @@ def parse_list_text(text):
             if parts and re.fullmatch(r"[0-9]{1,2}", parts[-1]):
                 rev = norm_rev(parts[-1])
                 title = " ".join(parts[:-1])
+        no, rsuf = split_rev_suffix(norm_dwg_no(m.group(1)))
         entries.append({
             "no": pre if re.fullmatch(r"\d{1,4}", pre) else None,
-            "dwg_no": norm_dwg_no(m.group(1)),
+            "dwg_no": no,
             "title": re.sub(r"\s+", " ", title) or None,
-            "scale": sraw, "scale_norm": snorm, "rev": rev,
+            "scale": sraw, "scale_norm": snorm, "rev": rev if rev is not None else rsuf,
             "raw": line.strip(), "method": "text",
         })
     return entries
@@ -364,64 +496,134 @@ def parse_list_text(text):
 # ---------------------------------------------------------------------------
 # 메인 처리
 # ---------------------------------------------------------------------------
+# 기본 영역에서 표제란 라벨을 못 찾으면 차례로 시도하는 후보 영역 (x0, y0, x1, y1 비율, 좌상단 원점)
+CANDIDATE_REGIONS = [
+    ("우상단", (0.6, 0.0, 1.0, 0.25)),
+    ("좌하단", (0.0, 0.75, 0.4, 1.0)),
+    ("좌상단", (0.0, 0.0, 0.4, 0.25)),
+    ("우측 띠", (0.7, 0.0, 1.0, 1.0)),
+    ("하단 띠", (0.0, 0.8, 1.0, 1.0)),
+    ("좌측 띠", (0.0, 0.0, 0.3, 1.0)),
+    ("상단 띠", (0.0, 0.0, 1.0, 0.2)),
+]
 
-def crop_text(page, region):
+
+def crop_text(page, region, warnings=None, loc=""):
     x0, y0, x1, y1 = region
-    W, H = page.width, page.height
-    bbox = (W * x0, H * y0, W * x1, H * y1)
+    bx0, btop, bx1, bbot = page.bbox
+    W, H = bx1 - bx0, bbot - btop
+    bbox = (bx0 + W * x0, btop + H * y0, bx0 + W * x1, btop + H * y1)
     try:
         return page.within_bbox(bbox).extract_text() or ""
-    except Exception:
+    except Exception as e:  # noqa: BLE001
+        if warnings is not None:
+            warnings.append("%s: 영역 %s 텍스트 추출 실패(%s: %s)" % (loc, ",".join("%g" % v for v in region),
+                                                              type(e).__name__, e))
         return ""
 
 
-def process_pdf(path, region, warnings):
+def _fmt_region(r):
+    return ",".join("%g" % v for v in r)
+
+
+def locate_title_block(page, full, region, vocab, warnings, loc):
+    """표제란 위치 탐색: 지정(기본) 영역 → 후보 영역(모서리·띠) → 페이지 전체.
+
+    '도면번호' 라벨 옆에서 번호를 찾은 첫 영역을 쓴다. 반환 (tb, ttext, region_name).
+    """
+    tried = [("기본", region)] + [(n, r) for n, r in CANDIDATE_REGIONS if list(r) != list(region)]
+    first_tb, first_text = None, ""
+    for name, reg in tried:
+        txt = crop_text(page, reg, warnings, loc)
+        tb = parse_title_block(txt, vocab)
+        if first_tb is None:
+            first_tb, first_text = tb, txt
+        if tb.get("_labeled"):
+            if name != "기본":
+                warnings.append("%s: 기본 표제란 영역(%s)에서 라벨을 못 찾아 '%s' 영역(%s)의 표제란을 사용함"
+                                % (loc, _fmt_region(region), name, _fmt_region(reg)))
+            return tb, txt, name
+    tb = parse_title_block(full, vocab)
+    if tb.get("_labeled"):
+        warnings.append("%s: 모든 후보 영역에서 표제란 라벨을 못 찾아 페이지 전체 텍스트의 라벨에서 도면번호를 찾음(%s)"
+                        " — --title-region 지정 권장" % (loc, tb["dwg_no"]))
+        return tb, full, "페이지 전체"
+    # 라벨이 어디에도 없음 → 기본 영역의 추정값, 없으면 전체 텍스트 추정값
+    if first_tb.get("dwg_no"):
+        return first_tb, first_text, "기본"
+    if tb.get("dwg_no"):
+        warnings.append("%s: 표제란 라벨이 없어 페이지 전체 텍스트에서 도면번호를 추정함(%s) — 확인 필요"
+                        % (loc, tb["dwg_no"]))
+        return tb, full, "페이지 전체"
+    return first_tb, first_text, "기본"
+
+
+def _read_page(page, loc, warnings):
+    try:
+        return page.extract_text() or ""
+    except Exception as e:  # noqa: BLE001
+        warnings.append("%s: 텍스트 추출 실패(%s) — 이미지로 확인 필요" % (loc, e))
+        return ""
+
+
+def process_pdfs(paths, region, warnings):
+    """모든 PDF 를 2단계로 처리: (1) 도면목록 수집 → (2) 목록 번호를 어휘로 표제란 해석."""
     pages_out, list_out = [], []
-    fname = os.path.basename(path)
-    with pdfplumber.open(path) as pdf:
-        for pno, page in enumerate(pdf.pages, start=1):
-            loc = "%s p.%d" % (fname, pno)
+    with contextlib.ExitStack() as stack:
+        docs = []
+        for path in paths:
             try:
-                full = page.extract_text() or ""
-            except Exception as e:
-                warnings.append("%s: 텍스트 추출 실패(%s) — 이미지로 확인 필요" % (loc, e))
-                full = ""
-            scanned = len(re.sub(r"\s", "", full)) < 30
+                pdf = stack.enter_context(pdfplumber.open(path))
+            except Exception as e:  # noqa: BLE001
+                sys.stderr.write("오류: PDF를 읽을 수 없습니다(%s): %s\n" % (path, e))
+                sys.exit(2)
+            docs.append((os.path.basename(path), pdf))
+
+        # 1단계: 텍스트·스캔 판정·도면목록 후보
+        info = []
+        for fname, pdf in docs:
+            for pno, page in enumerate(pdf.pages, start=1):
+                loc = "%s p.%d" % (fname, pno)
+                full = _read_page(page, loc, warnings)
+                scanned = len(re.sub(r"\s", "", full)) < 30
+                ents = []
+                if not scanned and LIST_KEYWORDS_RE.search(full):
+                    ents = parse_list_tables(page, loc, warnings)
+                    if not ents:
+                        dtext = crop_text(page, region, warnings, loc)
+                        body = full.replace(dtext, "") if dtext else full
+                        ents = parse_list_text(body, loc, warnings)
+                        if ents:
+                            warnings.append("%s: 도면목록 표 인식 실패 → 텍스트 줄 기반으로 %d행 추정(정확도 낮음)"
+                                            % (loc, len(ents)))
+                info.append((fname, pno, page, loc, full, scanned, ents))
+        vocab = {e["dwg_no"] for it in info for e in it[6] if e.get("dwg_no")}
+
+        # 2단계: 표제란
+        for fname, pno, page, loc, full, scanned, ents in info:
             rec = {"file": fname, "page": pno, "dwg_no": None, "title": None, "scale": None,
                    "scale_norm": None, "rev": None, "is_list": False, "scanned": scanned,
-                   "spec_tokens": [], "title_text_raw": ""}
+                   "spec_tokens": [], "title_text_raw": "", "title_region": None}
             if scanned:
                 warnings.append("%s: 텍스트가 거의 없음(스캔 도면 추정) — pdftoppm 으로 이미지 렌더링 후 육안 확인 필요" % loc)
                 pages_out.append(rec)
                 continue
-
-            ttext = crop_text(page, region)
+            tb, ttext, rname = locate_title_block(page, full, region, vocab, warnings, loc)
             rec["title_text_raw"] = ttext
-            tb = parse_title_block(ttext)
-            if not tb.get("dwg_no"):
-                # 표제란 영역에서 실패 → 전체 텍스트의 라벨 근처에서 재시도
-                tb2 = parse_title_block(full)
-                for k in ("dwg_no", "title", "scale", "scale_norm", "rev"):
-                    if not tb.get(k) and tb2.get(k) and not (k == "dwg_no" and tb2.get("_dwg_no_guess")):
-                        tb[k] = tb2[k]
-                if tb.get("dwg_no"):
-                    warnings.append("%s: 표제란 영역에서 도면번호를 못 찾아 페이지 전체 텍스트에서 추정함(%s)" % (loc, tb["dwg_no"]))
-            elif tb.get("_dwg_no_guess"):
+            rec["title_region"] = rname
+            if tb.get("_dwg_no_guess"):
                 warnings.append("%s: '도면번호' 라벨 없이 패턴으로 추정한 도면번호(%s) — 확인 권장" % (loc, tb["dwg_no"]))
+            if tb.get("_dwg_no_unparsed") and not tb.get("_labeled"):
+                warnings.append("%s: 도면번호 라벨 옆 값 '%s' 를 도면번호로 해석하지 못함 — 원본 확인 필요"
+                                % (loc, tb["_dwg_no_unparsed"]))
+            if tb.get("rev_suffix") is not None:
+                rec["rev_suffix"] = tb["rev_suffix"]
             for k in ("dwg_no", "title", "scale", "scale_norm", "rev"):
                 rec[k] = tb.get(k)
             if not rec["dwg_no"]:
                 warnings.append("%s: 도면번호 미검출 — 표제란 위치(--title-region) 확인 필요" % loc)
 
-            # 도면목록 페이지 판정 및 행 파싱
             if LIST_KEYWORDS_RE.search(full):
-                ents = parse_list_tables(page)
-                if not ents:
-                    # 표제란 텍스트 줄은 제외하고 텍스트 파싱
-                    body = full.replace(ttext, "") if ttext else full
-                    ents = parse_list_text(body)
-                    if ents:
-                        warnings.append("%s: 도면목록 표 인식 실패 → 텍스트 줄 기반으로 %d행 추정(정확도 낮음)" % (loc, len(ents)))
                 # 표제란의 자기 도면번호만 잡힌 경우 목록으로 보지 않음
                 ents = [e for e in ents if e["dwg_no"] != rec["dwg_no"] or len(ents) > 1]
                 if len(ents) >= 2:
@@ -444,16 +646,22 @@ def parse_region(s):
         vals = [float(v) for v in s.split(",")]
         assert len(vals) == 4 and all(0 <= v <= 1 for v in vals) and vals[0] < vals[2] and vals[1] < vals[3]
         return vals
-    except Exception:
+    except Exception:  # noqa: BLE001
         sys.stderr.write("오류: --title-region 형식이 잘못되었습니다. 예) 0.6,0.75,1,1 (0~1 비율, x0<x1, y0<y1)\n")
         sys.exit(2)
 
 
 def main():
+    for s in (sys.stdout, sys.stderr):
+        try:
+            s.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            pass
     ap = argparse.ArgumentParser(description="도면 PDF 표제란·도면목록·규격 토큰 추출")
     ap.add_argument("pdfs", nargs="+", help="도면 PDF 파일(여러 개 가능)")
     ap.add_argument("--title-region", default="0.6,0.75,1,1",
-                    help="표제란 영역 x0,y0,x1,y1 (페이지 대비 비율, 좌상단 원점). 기본 0.6,0.75,1,1")
+                    help="표제란 영역 x0,y0,x1,y1 (페이지 대비 비율, 좌상단 원점). 기본 0.6,0.75,1,1. "
+                         "이 영역에서 라벨을 못 찾으면 모서리·띠 영역, 페이지 전체 순으로 자동 재시도")
     ap.add_argument("--out", required=True, help="출력 JSON 경로 (예: dwg.json)")
     args = ap.parse_args()
 
@@ -463,15 +671,8 @@ def main():
             sys.stderr.write("오류: 파일을 찾을 수 없습니다: %s\n" % p)
             sys.exit(2)
 
-    warnings, pages, dlist = [], [], []
-    for p in args.pdfs:
-        try:
-            po, lo = process_pdf(p, region, warnings)
-        except Exception as e:
-            sys.stderr.write("오류: PDF를 읽을 수 없습니다(%s): %s\n" % (p, e))
-            sys.exit(2)
-        pages.extend(po)
-        dlist.extend(lo)
+    warnings = []
+    pages, dlist = process_pdfs(args.pdfs, region, warnings)
 
     if not dlist:
         warnings.append("도면목록 페이지를 찾지 못함 — 목록 대조(D01~D03)는 생략됨")

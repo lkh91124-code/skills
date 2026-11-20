@@ -12,6 +12,7 @@
     D02  축척 누락 또는 목록과 축척 상이(낮음)
     D03  개정번호 목록과 상이(중간)
     D04  동일 도면번호가 여러 페이지에 중복(중간)
+    E00  검사 실패(높음) — 스크립트 내부 오류로 검사를 끝내지 못함. 결과 신뢰 불가
 스캔 페이지는 판정 불가 → 경고로 남겨 이미지 확인을 요청한다.
 """
 import argparse
@@ -43,6 +44,11 @@ def loc_list(e):
 
 
 def main():
+    for s in (sys.stdout, sys.stderr):
+        try:
+            s.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            pass
     ap = argparse.ArgumentParser(description="도면 세트 정합성 검사(D01~D04)")
     ap.add_argument("dwg_json", help="extract_drawings.py 출력 JSON")
     ap.add_argument("--out", required=True, help="결과 findings JSON 경로")
@@ -61,7 +67,23 @@ def main():
     dlist = dwg.get("drawing_list", [])
     findings = []
     warnings = list(dwg.get("warnings", []))  # 추출 단계 경고를 그대로 전달
+    try:
+        run_checks(pages, dlist, findings, warnings)
+    except Exception as e:  # noqa: BLE001 - 검사 실패는 숨기지 않고 E00 으로 보고
+        findings.append(make_finding(
+            "E00", "높음", "check_drawings.py (%s)" % os.path.basename(args.dwg_json),
+            "검사 실패: 도면 정합성 검사(D01~D04)를 끝내지 못함 — 이 검사 결과는 신뢰할 수 없음",
+            "%s: %s" % (type(e).__name__, e),
+            "입력 JSON(extract_drawings.py 출력)을 확인하고 재실행. 해결되지 않으면 도면목록·표제란을 수동 대조"))
 
+    src = ", ".join(dwg.get("source_files") or []) or os.path.basename(args.dwg_json)
+    out = {"source": src, "findings": findings, "warnings": warnings}
+    write_json(out, args.out)
+    print("도면 검사 완료: 지적 %d건, 경고 %d건 → %s" % (len(findings), len(warnings), args.out))
+
+
+def run_checks(pages, dlist, findings, warnings):
+    """D01~D04 검사. findings·warnings 에 추가한다."""
     # 판정 대상: 스캔 아님 + 도면번호 있음
     scanned = [p for p in pages if p.get("scanned")]
     drawings = [p for p in pages if not p.get("scanned") and p.get("dwg_no")]
@@ -151,10 +173,6 @@ def main():
                 "도면목록의 %s(%s) 도면이 PDF에 없음%s" % (no, e.get("title"), note),
                 "목록 행: %s" % e.get("raw"),
                 "누락 도면 수령 요청 또는 목록 정정"))
-
-    out = {"source": args.dwg_json, "findings": findings, "warnings": warnings}
-    write_json(out, args.out)
-    print("도면 검사 완료: 지적 %d건, 경고 %d건 → %s" % (len(findings), len(warnings), args.out))
 
 
 if __name__ == "__main__":

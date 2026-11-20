@@ -31,7 +31,7 @@ CAT_LABEL = OrderedDict([
     ("steel", "강재 단면"),
     ("thk", "두께"),
     ("pipe", "관경"),
-    ("ks", "KS 규격"),
+    ("ks", "KS"),
     ("size", "부재 치수"),
 ])
 # 한쪽에만 있을 때의 심각도 (도면에만 / 내역서에만)
@@ -68,6 +68,11 @@ def fmt_locs(locs):
 
 
 def main():
+    for s in (sys.stdout, sys.stderr):
+        try:
+            s.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            pass
     ap = argparse.ArgumentParser(description="내역서-도면 규격 토큰 교차 확인(X01)")
     ap.add_argument("boq_json", help="extract_boq.py 출력 JSON")
     ap.add_argument("dwg_json", help="extract_drawings.py 출력 JSON")
@@ -88,7 +93,8 @@ def main():
         sys.exit(2)
 
     warnings = []
-    boq_src = boq.get("source", os.path.basename(args.boq_json))
+    # 위치 표기는 파일명만 사용(전체 경로는 보고서를 길게 하고 사용자 경로를 노출함)
+    boq_src = os.path.basename(str(boq.get("source") or args.boq_json).replace("\\", "/"))
 
     # 도면 토큰 수집: (cat, token) -> [위치], 원문 예시
     d_tok, d_raw = defaultdict(list), {}
@@ -101,7 +107,7 @@ def main():
             if t["cat"] not in CAT_LABEL:
                 continue
             key = (t["cat"], t["token"])
-            d_tok[key].append("%s p.%d" % (p["file"], p["page"]))
+            d_tok[key].append("%s p.%d" % (os.path.basename(str(p["file"]).replace("\\", "/")), p["page"]))
             d_raw.setdefault(key, t.get("raw"))
     if n_scanned:
         warnings.append("X01: 스캔 도면 %d페이지는 규격 토큰을 추출하지 못해 교차 확인에서 제외됨 — 이미지로 확인 필요" % n_scanned)
@@ -125,6 +131,23 @@ def main():
         warnings.append("X01: 내역서에서 규격 토큰을 찾지 못해 교차 확인 결과가 제한적임")
 
     findings = []
+    try:
+        compare(b_tok, b_raw, d_tok, d_raw, findings)
+    except Exception as e:  # noqa: BLE001 - 검사 실패는 숨기지 않고 E00 으로 보고
+        findings.append(make_finding(
+            "E00", "높음", "cross_check.py",
+            "검사 실패: 도면-내역 규격 교차 확인(X01)을 끝내지 못함 — 이 검사 결과는 신뢰할 수 없음",
+            "%s: %s" % (type(e).__name__, e),
+            "입력 JSON(boq.json, dwg.json)을 확인하고 재실행. 해결되지 않으면 주요 규격을 수동 대조"))
+
+    out = {"source": "%s ↔ %s" % (os.path.basename(args.boq_json), os.path.basename(args.dwg_json)),
+           "findings": findings, "warnings": warnings}
+    write_json(out, args.out)
+    print("교차 확인 완료: 확인 필요 %d건, 경고 %d건 → %s" % (len(findings), len(warnings), args.out))
+
+
+def compare(b_tok, b_raw, d_tok, d_raw, findings):
+    """카테고리별로 한쪽에만 있는 토큰을 X01 로 보고."""
     for cat, label in CAT_LABEL.items():
         b_cat_tokens = sorted(t for (c, t) in b_tok if c == cat)
         d_cat_tokens = sorted(t for (c, t) in d_tok if c == cat)
@@ -170,11 +193,6 @@ def main():
                     % (raw_map.get((cat, t)), other,
                        ", ".join(d_cat_tokens if direction == "boq" else b_cat_tokens)[:200]),
                     rec))
-
-    out = {"source": "%s ↔ %s" % (os.path.basename(args.boq_json), os.path.basename(args.dwg_json)),
-           "findings": findings, "warnings": warnings}
-    write_json(out, args.out)
-    print("교차 확인 완료: 확인 필요 %d건, 경고 %d건 → %s" % (len(findings), len(warnings), args.out))
 
 
 if __name__ == "__main__":

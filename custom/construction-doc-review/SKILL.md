@@ -44,25 +44,34 @@ metadata:
 
 ## 워크플로우
 
-스크립트는 스킬 폴더 기준 `scripts/` 에 있다. 아래에서 `SKILL_DIR` 은 이 SKILL.md 가 있는 폴더,
-`WORK` 는 임시 작업 폴더(예: `mktemp -d`)다. **사용자 원본 파일은 읽기만 하고, 모든 출력은 `WORK` 에 쓴다.**
+스크립트는 스킬 폴더 기준 `scripts/` 에 있다. `SKILL_DIR` 은 이 SKILL.md 가 있는 폴더,
+`WORK` 는 임시 작업 폴더다. **사용자 원본 파일은 읽기만 하고, 모든 출력은 `WORK` 에 쓴다.**
 
 ```bash
 SKILL_DIR=<이 스킬 폴더>; WORK=$(mktemp -d)
 ```
 
+**Windows / PowerShell**
+- `python3` 이 없으면 `python` 또는 `py` 로 실행한다. 줄 이어쓰기는 `\` 대신 한 줄로 쓰거나 백틱(`` ` ``)을 쓴다.
+- 작업 폴더: `$WORK = New-Item -ItemType Directory -Path "$env:TEMP\cdr_$(Get-Random)"` 후 `"$WORK\boq.json"` 처럼 쓴다.
+- PowerShell 은 `*.json` 을 펼치지 않으므로 `render_report.py` 에는 폴더(`"$WORK"`)나 따옴표 친 패턴을 넘긴다(스크립트가 직접 펼침).
+- `pdftoppm` 은 Poppler 에 포함된다: `winget install oschwartz10612.Poppler` 또는 `conda install -c conda-forge poppler`.
+
 ### 1. 내역서 추출·검사
 
 ```bash
 python3 "$SKILL_DIR/scripts/extract_boq.py" 내역서.xlsx [--sheet 내역서] [--header-row 4] --out "$WORK/boq.json"
-python3 "$SKILL_DIR/scripts/extract_boq.py" 내역서.pdf [--pages 3-20] --out "$WORK/boq.json"
+python3 "$SKILL_DIR/scripts/extract_boq.py" 내역서.pdf [--pages 3-20] [--header-row 2] --out "$WORK/boq.json"
 python3 "$SKILL_DIR/scripts/check_boq.py" "$WORK/boq.json" [--tol 1] [--outlier-pct 5] --out "$WORK/findings_boq.json"
 ```
 
 - 추출 후 `stats`(rows, low_confidence_ratio, scanned_pages)와 `warnings` 를 먼저 본다.
-  - 헤더를 못 찾으면: 파일을 열어 헤더 행 번호를 확인하고 `--header-row` 지정
-  - "수식 계산값이 저장되어 있지 않습니다" → 사용자에게 Excel 에서 열어 저장한 파일을 요청
+  - 헤더를 못 찾으면: 원본에서 헤더 행 번호를 확인해 `--header-row` 지정. xlsx 는 시트 행 번호,
+    **PDF 는 추출된 표 안에서의 행 번호**(페이지 상단 제목 줄은 세지 않음)다.
+  - "수식 계산값이 저장되어 있지 않습니다" → Excel 에서 열어 저장한 파일을 요청
   - 행 수가 원본과 크게 다르면 표본 몇 행을 원본과 대조
+- **집계표 시트 + 공종별 내역 시트**가 함께 있는 xlsx 는 `--sheet <내역 시트>` 로 내역만 추출한다.
+  여러 시트를 함께 추출했다면 집계표 금액이 중복 합산되지 않는지, C02 가 시트별로 맞게 비교되는지 확인한다.
 - 2행 헤더(재료비/노무비/경비/합계 × 단가/금액), 병합 셀, 페이지마다 반복되는 헤더는 자동 처리된다.
 
 ### 2. 스캔 페이지·저신뢰 행 처리
@@ -73,8 +82,11 @@ python3 "$SKILL_DIR/scripts/check_boq.py" "$WORK/boq.json" [--tol 1] [--outlier-
 pdftoppm -r 150 -f N -l N -png 원본.pdf "$WORK/page"   # → $WORK/page-N.png (자릿수 패딩 가능)
 ```
 
-이미지를 열어 필요한 값을 판독하고, 그 값으로 낸 지적은 근거에 **`근거: 이미지판독`** 을 붙인다.
-판독이 불확실하면 "확인 필요"로 남긴다. 페이지가 많으면 금액이 큰 공종·소계 페이지부터 본다.
+- `pdftoppm` 이 없으면: `pypdfium2` 가 설치돼 있으면
+  `python -c "import pypdfium2 as p; p.PdfDocument('원본.pdf')[N-1].render(scale=2).to_pil().save('page.png')"`,
+  둘 다 없으면 사용자에게 해당 페이지 스크린샷을 요청한다.
+- 이미지로 판독한 값으로 낸 지적은 근거에 **`근거: 이미지판독`** 을 붙인다. 불확실하면 "확인 필요"로 남긴다.
+  페이지가 많으면 금액이 큰 공종·소계 페이지부터 본다.
 
 ### 3. 원가계산서 검사
 
@@ -83,6 +95,7 @@ python3 "$SKILL_DIR/scripts/check_cost_summary.py" 원가계산서.xlsx [--sheet
   --boq "$WORK/boq.json" [--rates "$WORK/rates.json"] [--tol 1] --out "$WORK/findings_cost.json"
 ```
 
+- C01 요율 계산, C02 내역서 기초금액 대비, **C03 원가계산서 자체 합산**(재료비계·순공사원가·총원가 등)을 본다.
 - `--rates` 는 사용자가 기준 요율을 준 경우에만 만든다(형식: `references/rates-guide.md`). 요율을 추측해 넣지 않는다.
 - 결과 JSON 의 `parsed` 로 비목 인식이 맞는지 확인한다. 경고의 "역산 요율"은 요율 정보가 없을 때의 참고값이다.
 
@@ -94,42 +107,55 @@ python3 "$SKILL_DIR/scripts/check_drawings.py" "$WORK/dwg.json" --out "$WORK/fin
 python3 "$SKILL_DIR/scripts/cross_check.py" "$WORK/boq.json" "$WORK/dwg.json" --out "$WORK/findings_x.json"
 ```
 
-- `--title-region` 은 표제란 위치(페이지 대비 비율 x0,y0,x1,y1, 기본 우하단 0.6,0.75,1,1). 표제란이 다른 곳이면
-  한 페이지를 `pdftoppm` 으로 보고 비율을 정해 다시 실행한다.
+- 표제란은 기본 우하단에서 찾고, 라벨이 없으면 다른 모서리·띠·페이지 전체 순으로 자동 재시도한다(경고에 사용 영역 표시).
+  경고가 많거나 도면번호가 틀리면 한 페이지를 이미지로 보고 `--title-region x0,y0,x1,y1`(비율) 로 다시 실행한다.
+- 도면번호는 A-101, A101, E01, ARCH-101, 기계-01, A-101-01-2, S-201R1(→S-201, 개정 1) 형식을 인식한다.
+  도면목록에서 해석하지 못한 행은 경고로 남으므로 원본과 대조한다.
 - 스캔 도면은 2단계와 같이 이미지로 표제란을 판독한다.
 
 ### 5. 보고서 초안 생성
 
 ```bash
-python3 "$SKILL_DIR/scripts/render_report.py" "$WORK"/findings_*.json --out "$WORK/report.md"
+python3 "$SKILL_DIR/scripts/render_report.py" "$WORK" --out "$WORK/report.md"   # 폴더 → findings*.json
 ```
+
+- 파일 목록이나 따옴표 친 글로브(`"$WORK/findings_*.json"`)도 받는다.
+- **E00(검사 실패)** 이 있으면 요약에 "검사 실패 N건 — 결과 신뢰 불가"가 표시된다. 원인(입력 형식, 옵션)을 고쳐
+  재실행하고, 끝내 실패하면 해당 검사 범위를 "미검토"로 보고서에 명시한다.
 
 ### 6. 에이전트 검토 (필수)
 
 자동 결과를 그대로 전달하지 않는다.
 
-1. **오탐 제거·병합**: 각 지적의 위치를 원본(또는 이미지)으로 확인. 추출 오류(열 밀림, 줄바꿈)로 생긴 지적은 삭제,
-   연쇄 지적(항목 오류 → 소계 → 합계)은 원인 1건으로 묶는다. 의도된 반복(층별 동일 수량 B04 등)은 근거와 함께 낮춤.
+1. **오탐 제거·병합**: 각 지적의 위치를 원본(또는 이미지)으로 확인. 추출 오류(열 밀림, 줄바꿈)로 생긴 지적은 삭제.
+   **"연쇄 가능"** 표시가 붙은 지적(항목 오류 → 소계 → 합계, 경비계 → 이윤 등)은 원인 지적 1건으로 병합하고
+   근거에 "연쇄: …"로 묶는다. 의도된 반복(층별 동일 수량 B04 등)은 근거와 함께 낮춤.
 2. **B06 누락 공종 판단**: `references/error-catalog.md` 체크리스트와 내역서 공종 목록을 대조해 누락 의심을 추가.
 3. **X01 정리**: 주요 부재(콘크리트 강도, 철근 규격·강종, 강재 단면) 위주로 남기고 잡음은 요약.
 4. 심각도는 `references/error-catalog.md` 기준으로 조정. 가정(요율 출처, 소계 범위 추정 등)은 근거에 명시.
 
 ## 보고서 형식
 
+`render_report.py` 출력과 같은 구성을 유지한다(에이전트 검토 후 내용만 다듬는다).
+
 ```markdown
 # <공사명> 내역서·원가계산서·도면 검토 결과
 
+작성일시: YYYY-MM-DD HH:MM
+본 보고서는 검토 보조 자료이며 공인 검토를 대체하지 않습니다.
+
 ## 요약
-- 검토 대상: 파일명(시트/페이지 범위)
-- 지적: 높음 N건 / 중간 N건 / 낮음 N건 — 핵심 3~5줄 (금액 영향 큰 순)
+> **검사 실패 N건 — 결과 신뢰 불가.**   ← E00 이 있을 때만
+- 검토 입력: 파일명(시트/페이지 범위)
+- 지적 사항: 총 N건 (높음 N · 중간 N · 낮음 N), 코드별 건수 — 핵심 3~5줄(금액 영향 큰 순)
 
 ## 지적 사항
-| 번호 | 코드 | 심각도 | 위치(페이지·행) | 내용 | 근거 | 권고 |
+| 번호 | 심각도 | 코드 | 위치(페이지·행) | 내용 | 근거 | 권고 |
 |---|---|---|---|---|---|---|
-| 1 | B01 | 높음 | 시트 '내역서' 8행 (안전난간) | 합계 금액 산술 오류 | 50 × 5,000 = 250,000, 기재 260,000 | 금액 재계산 |
+| 1 | 높음 | B01 | 시트 '내역서' 8행 (안전난간) | 합계 금액 산술 오류 | 50 × 5,000 = 250,000, 기재 260,000 | 금액 재계산 |
 
-## 검토 한계
-- 자동 추출 기반이며 스캔·저신뢰 페이지(목록)는 이미지 판독/미검토
+## 검토 한계 및 경고
+- 스크립트 경고(스캔·저신뢰 페이지, 표제란 영역 재탐색, 목록 행 인식 실패 등)
 - 요율 적정성은 미검증(문서 표기 기준 계산 일치 여부만 확인) / 적용 요율 출처
 - 단가 적정성(물가·일위대가)·수량 산출 근거(도면 물량 산출)는 범위 밖
 ```
@@ -139,12 +165,12 @@ python3 "$SKILL_DIR/scripts/render_report.py" "$WORK"/findings_*.json --out "$WO
 - **사용자 파일을 절대 수정·덮어쓰지 않는다.** 출력은 작업 폴더에만 쓴다.
 - 가정·추정은 반드시 "가정:"으로 표시(요율 출처, 소계 범위, 단위 해석 등). 요율·법정 기준을 기억으로 단정하지 않는다.
 - 지적마다 위치와 숫자 근거를 단다. 근거 없는 지적은 넣지 않는다.
-- 결과는 **검토 보조 자료**이며 공인 적산·감리 검토를 대체하지 않는다는 문구를 보고서에 넣는다.
+- 보고서에 "본 보고서는 검토 보조 자료이며 공인 검토를 대체하지 않습니다." 문구를 유지한다.
 - 스크립트가 치명적 오류(종료 코드 ≠ 0)를 내면 메시지를 읽고 옵션(`--sheet`, `--pages`, `--header-row`)을 조정한다.
-  행 단위 문제는 경고로 남고 처리는 계속된다.
+  행 단위 문제는 경고로, 검사 단위 실패는 E00 지적으로 남고 처리는 계속된다.
 
 ## 참고
 
-- `references/error-catalog.md` — 코드(B01~B06, C01~C03, D01~D04, X01)·심각도 기준·누락 공종 체크리스트
+- `references/error-catalog.md` — 코드(B01~B06, C01~C03, D01~D04, X01, E00)·심각도 기준·누락 공종 체크리스트
 - `references/rates-guide.md` — 요율 산정기준, 연도별 변경 주의, `rates.json` 형식
 - `scripts/_numparse.py` — 공용 숫자/단위 파서 (△·괄호 음수, 전각, ㎡→m2 등)

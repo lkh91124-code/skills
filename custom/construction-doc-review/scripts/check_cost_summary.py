@@ -392,12 +392,39 @@ def check_sums(rows, v, tol, F):
             " + ".join([a["key"]] + [r["label"] for r in mids]))
 
 
+_SUMMARY_SEG_WORDS = ("집계", "총괄", "요약", "갑지", "summary")
+
+
+def _is_summary_segment(seg, items):
+    """집계표/총괄표 구간 판단: 시트명이 집계류이거나, 항목이 전부 '식' 단위 수량 1 인 구간."""
+    if any(w in (seg or "").lower() for w in _SUMMARY_SEG_WORDS):
+        return True
+    return bool(items) and all(
+        (r.get("unit") or "").strip() in ("식", "式", "LS", "ls", "L.S")
+        and (r.get("qty") in (None, 1, 1.0)) for r in items)
+
+
 def check_boq(agg, v, boq, tol, F, warnings):
-    items = [r for r in boq.get("rows", []) if r.get("type") == "item"]
-    totals = {}
-    for r in boq.get("rows", []):
-        if r.get("type") == "total":
-            totals[r.get("segment")] = r  # 구간별 마지막 합계
+    """C02: 원가계산서 직접재료비·직접노무비·기계경비 vs 내역서 금액.
+
+    내역서에 집계표와 내역 시트가 함께 있으면 전체 합산은 이중 계상이 되므로 구간(시트) 별로
+    비교한다. 어느 구간의 항목 합 또는 합계행과 맞으면 통과. 집계 구간을 뺀 구간 전체 합
+    (공종별로 시트가 나뉜 내역서)도 후보로 둔다.
+    """
+    rows = boq.get("rows", [])
+    segs = {}
+    for r in rows:
+        sg = segs.setdefault(r.get("segment", ""), {"items": [], "totals": []})
+        if r.get("type") == "item":
+            sg["items"].append(r)
+        elif r.get("type") == "total":
+            sg["totals"].append(r)
+    detail = [s for s, d in segs.items() if d["items"] and not _is_summary_segment(s, d["items"])]
+    summ = [s for s, d in segs.items() if d["items"] and _is_summary_segment(s, d["items"])]
+    if summ:
+        warnings.append(f"내역서 집계 구간 {summ} 은 C02 전체 합산에서 제외하고 구간별로만 비교")
+    # 대표 구간: 항목 행이 가장 많은 구간 (보고용)
+    main_seg = max(segs, key=lambda s: len(segs[s]["items"])) if segs else ""
     pairs = [("직접재료비", "mat_amt", "재료비"), ("직접노무비", "lab_amt", "노무비"),
              ("기계경비", "exp_amt", "경비")]
     for ck, col, lab in pairs:
@@ -405,22 +432,37 @@ def check_boq(agg, v, boq, tol, F, warnings):
         if key not in v or v[key] is None:
             warnings.append(f"원가계산서에 {ck} 항목이 없어 내역서 대비 검사 생략")
             continue
-        cands = {"내역 항목 합": sum(r.get(col) or 0 for r in items)}
-        if totals:
-            cands["내역 합계행"] = sum((t.get(col) or 0) for t in totals.values())
-        if all(c == 0 for c in cands.values()):
+        cands = []  # (이름, 값, 대표여부)
+        for sname, d in segs.items():
+            lab_s = f"'{sname}'" if sname else "내역"
+            if d["items"]:
+                cands.append((f"{lab_s} 항목 합", sum(r.get(col) or 0 for r in d["items"]),
+                              sname == main_seg))
+            if d["totals"]:
+                cands.append((f"{lab_s} 합계행", d["totals"][-1].get(col) or 0, sname == main_seg))
+        if len(detail) > 1:
+            cands.append((f"구간 {detail} 항목 합", sum(r.get(col) or 0 for s in detail
+                                                       for r in segs[s]["items"]), False))
+        cands = [c for c in cands if c[1] != 0]
+        if not cands:
             continue
-        if any(match_with_rounding(c, v[key], tol) for c in cands.values()):
+        if any(match_with_rounding(c, v[key], tol) for _, c, _ in cands):
             continue
+        shown = sorted(cands, key=lambda c: not c[2])[:4]
         F.append(make_finding(
             "C02", "높음", f"원가계산서 {key}",
             f"{key}가 내역서 {lab} 금액과 불일치",
-            f"원가계산서 {fmt_num(v[key])} vs " + ", ".join(f"{n} {fmt_num(c)}" for n, c in cands.items())
+            f"원가계산서 {fmt_num(v[key])} vs " + ", ".join(f"{n} {fmt_num(c)}" for n, c, _ in shown)
             + (" (내역서 저신뢰/스캔 페이지 있음)" if (boq.get('stats') or {}).get('scanned_pages') else ""),
             "내역서 집계 금액과 원가계산서 기초금액(관급자재·제외 공종 포함 여부) 확인"))
 
 
 def main():
+    for st in (sys.stdout, sys.stderr):
+        try:
+            st.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            pass
     ap = argparse.ArgumentParser(description="원가계산서 요율·합산·내역서 연계 검사")
     ap.add_argument("file", help="원가계산서 (.xlsx/.pdf)")
     ap.add_argument("--sheet", help="엑셀 시트 이름")

@@ -24,6 +24,8 @@ __all__ = [
     "SEVERITIES",
     "fmt_num",
     "match_with_rounding",
+    "ROUNDING_UNITS_COST",
+    "ROUNDING_UNITS_ITEM",
 ]
 
 SEVERITIES = ("높음", "중간", "낮음")
@@ -201,10 +203,19 @@ def fmt_num(v: Optional[float]) -> str:
     return f"{v:,.3f}".rstrip("0").rstrip(".")
 
 
+ROUNDING_UNITS_COST = (1, 10, 100, 1000)  # 원가계산서 요율·합계 비목: 10/100/1000원 단수정리 관행 허용
+ROUNDING_UNITS_ITEM = (1,)                 # 내역서 항목 산술(수량×단가, 재+노+경): 1원 단위만 허용
+
+
 def match_with_rounding(expected: Optional[float], actual: Optional[float],
-                        tol: float = 1.0, units=(1, 10, 100, 1000)) -> bool:
-    """계산값 expected 를 1/10/100/1000원 단위로 절사·반올림한 값(절상은 1원만) 중 하나가
-    actual 과 tol 이내로 일치하면 True. (원가계산서·내역서의 단수 처리 허용)"""
+                        tol: float = 1.0, units=ROUNDING_UNITS_COST) -> bool:
+    """계산값 expected 를 units 의 각 단위(원)로 절사(floor/trunc)·반올림한 값 중 하나가
+    actual 과 tol 이내로 일치하면 True.
+
+    - units=(1, 10, 100, 1000) (기본): 원가계산서 요율 비목·총원가 등 단수정리 관행 허용.
+    - units=(1,): 내역서 항목 산술용. 1원 미만 절사·반올림만 허용하므로
+      10~999원 단위의 실제 오류를 숨기지 않는다.
+    """
     if expected is None or actual is None:
         return False
     if approx_equal(expected, actual, tol):

@@ -10,7 +10,10 @@
   B03 (중간) 같은 품명·규격인데 단위가 다름
   B04 (중간) 중복 항목 (같은 공종 경로 + 품명·규격 + 수량)
   B05 (중간) 같은 품명·규격인데 단가 차이가 기준(%) 초과
-금액 비교 시 1/10/100/1000원 단위 절사·반올림은 일치로 본다.
+  E00 (높음) 검사 자체가 실패함 — 해당 검사 결과 신뢰 불가
+금액 비교는 1원 미만 절사·반올림만 일치로 본다 (10~999원 단위 오차도 지적).
+하위 항목의 오류가 그대로 상위 소계/합계 차이로 이어진 경우(차이 금액 동일) 상위 지적은
+"(연쇄 가능: <원인 위치>)" 를 붙이고 중간으로 낮춘다.
 """
 
 from __future__ import annotations
@@ -21,8 +24,10 @@ import sys
 from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _numparse import (fmt_num, make_finding, match_with_rounding, norm_key,  # noqa: E402
-                       norm_unit, read_json, write_json)
+from _numparse import (ROUNDING_UNITS_ITEM, fmt_num, make_finding,  # noqa: E402
+                       match_with_rounding, norm_key, norm_unit, read_json, write_json)
+
+U1 = ROUNDING_UNITS_ITEM  # 내역서 산술은 1원 단위 단수만 허용
 
 COMP = [("mat", "재료비"), ("lab", "노무비"), ("exp", "경비"), ("tot", "합계")]
 AMT_COLS = [("mat_amt", "재료비"), ("lab_amt", "노무비"), ("exp_amt", "경비"), ("tot_amt", "합계")]
@@ -34,6 +39,8 @@ def loc_str(r) -> str:
     loc = r.get("loc", {})
     if "sheet" in loc:
         s = f"시트 '{loc['sheet']}' {loc.get('row')}행"
+    elif loc.get("mode") == "words":
+        s = f"{loc.get('page')}페이지 {loc.get('row')}번째 줄"
     else:
         s = f"{loc.get('page')}페이지 표{loc.get('row')}행"
     label = r.get("name") or r.get("code") or ""
@@ -46,8 +53,15 @@ def item_label(r) -> str:
     return (r.get("name") or "") + (f" {r['spec']}" if r.get("spec") else "")
 
 
+def _meta(f, idx, r, col, diff):
+    """연쇄 판정용 내부 정보 (출력 전에 제거)."""
+    f["_meta"] = {"idx": idx, "seg": r.get("segment", ""), "type": r["type"], "col": col,
+                  "diff": diff, "loc": loc_str(r)}
+    return f
+
+
 def check_b01(rows, tol, F):
-    for r in rows:
+    for idx, r in enumerate(rows):
         if r["type"] not in ("item", "subtotal", "total"):
             continue
         conf = " (저신뢰 추출 행 — 원본 확인 필요)" if r.get("low_confidence") else ""
@@ -58,13 +72,19 @@ def check_b01(rows, tol, F):
                 if up is None or amt is None:
                     continue
                 exp = r["qty"] * up
-                if not match_with_rounding(exp, amt, tol):
-                    F.append(make_finding(
+                ktol = tol
+                if key == "tot":
+                    # 합계금액 = 재·노·경 금액(각각 1원 미만 절사)의 합이면 성분 수만큼 단수 오차가 누적됨
+                    n_parts = sum(1 for k in ("mat", "lab", "exp") if r.get(f"{k}_amt"))
+                    ktol = tol + max(n_parts - 1, 0)
+                if not match_with_rounding(exp, amt, ktol, units=U1):
+                    F.append(_meta(make_finding(
                         "B01", "높음", loc_str(r),
                         f"{label} 금액 산술 오류",
                         f"수량 {fmt_num(r['qty'])} × 단가 {fmt_num(up)} = {fmt_num(exp)}, "
                         f"기재 {fmt_num(amt)} (차이 {fmt_num(amt - exp)}){conf}",
-                        "수량·단가·금액 셀을 원본에서 확인하고 금액 재계산"))
+                        "수량·단가·금액 셀을 원본에서 확인하고 금액 재계산"),
+                        idx, r, f"{key}_amt", amt - exp))
         # 2) 재료비 + 노무비 + 경비 = 합계 (단가·금액)
         for suffix, what in (("up", "단가"), ("amt", "금액")):
             if r["type"] != "item" and suffix == "up":
@@ -74,13 +94,16 @@ def check_b01(rows, tol, F):
             if tot is None or all(p is None for p in parts):
                 continue
             s = sum(p or 0 for p in parts)
-            if not match_with_rounding(s, tot, tol):
-                F.append(make_finding(
+            if not match_with_rounding(s, tot, tol, units=U1):
+                present = [(lab, p) for lab, p in zip(("재료비", "노무비", "경비"), parts)
+                           if p is not None]
+                expr = " + ".join(f"{lab} {fmt_num(p)}" for lab, p in present)
+                F.append(_meta(make_finding(
                     "B01", "높음", loc_str(r),
                     f"재료비+노무비+경비 ≠ 합계 ({what})",
-                    f"{' + '.join(fmt_num(p) for p in parts)} = {fmt_num(s)}, "
+                    f"{expr} = {fmt_num(s)}, "
                     f"합계 기재 {fmt_num(tot)} (차이 {fmt_num(tot - s)}){conf}",
-                    f"합계{what} 산식 확인"))
+                    f"합계{what} 산식 확인"), idx, r, f"tot_{suffix}", tot - s))
 
 
 def check_b02(rows, tol, F, warnings):
@@ -117,18 +140,18 @@ def check_b02(rows, tol, F, warnings):
                 if v is None:
                     continue
                 sums = [(n, sum(x.get(col) or 0 for x in c), len(c)) for n, c in cands]
-                if any(match_with_rounding(s, v, tol) for _, s, _ in sums):
+                if any(match_with_rounding(s, v, tol, units=U1) for _, s, _ in sums):
                     continue
                 n0, s0, k0 = sums[0]
                 kind = "합계" if r["type"] == "total" else "소계"
                 path = " > ".join(r.get("path") or []) or "(경로 미상)"
-                F.append(make_finding(
+                F.append(_meta(make_finding(
                     "B02", "높음", loc_str(r),
                     f"{kind} {label} 금액이 하위 항목 합과 불일치 (공종: {path})",
                     f"하위 {k0}개 항목 합 {fmt_num(s0)} vs 기재 {fmt_num(v)} "
                     f"(차이 {fmt_num(v - s0)}; 비교범위: {n0})"
                     + (" — 소계 범위 추정이 불확실할 수 있음" if r.get("closes") is None else ""),
-                    f"{kind} 범위와 합산식(SUM 범위 누락/중복) 확인"))
+                    f"{kind} 범위와 합산식(SUM 범위 누락/중복) 확인"), i, r, col, v - s0))
 
 
 def check_keys(rows, pct, F):
@@ -193,7 +216,36 @@ def check_keys(rows, pct, F):
                     "적용 단가(일위대가·물가자료) 및 할증 적용 여부 확인"))
 
 
+def tag_cascades(F, tol):
+    """상위 소계/합계(B01·B02)의 차이가 앞선 하위 지적의 차이와 같은 금액이면 연쇄로 표시.
+
+    같은 구간·같은 금액 열에서, 앞 행의 지적 차이 절댓값과 tol 이내로 같으면 원인 위치를 붙이고
+    심각도를 중간으로 낮춘다 (원인 지적은 그대로 높음). 단순 금액 일치 기준이라 '가능'으로만 표기.
+    """
+    metas = [(f, f.get("_meta")) for f in F if f.get("_meta")]
+    metas.sort(key=lambda t: t[1]["idx"])
+    root = {}  # id(finding) → 원인 위치
+    for k, (f, m) in enumerate(metas):
+        if m["type"] not in ("subtotal", "total") or abs(m["diff"]) <= tol:
+            continue
+        for f0, m0 in metas[:k]:
+            if (m0["idx"] < m["idx"] and m0["seg"] == m["seg"] and m0["col"] == m["col"]
+                    and abs(abs(m0["diff"]) - abs(m["diff"])) <= tol):
+                src = root.get(id(f0), m0["loc"])
+                root[id(f)] = src
+                f["content"] += f" (연쇄 가능: {src})"
+                f["severity"] = "중간"
+                break
+    for f in F:
+        f.pop("_meta", None)
+
+
 def main():
+    for st in (sys.stdout, sys.stderr):
+        try:
+            st.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            pass
     ap = argparse.ArgumentParser(description="내역서 산술·소계·중복·단위·단가 자동 검사")
     ap.add_argument("boq", help="extract_boq.py 출력 JSON")
     ap.add_argument("--tol", type=float, default=1.0, help="금액 허용오차(원), 기본 1")
@@ -212,13 +264,20 @@ def main():
         sys.exit("오류: boq.json 형식이 아닙니다 (rows 없음). extract_boq.py 출력을 넣어 주세요.")
 
     F, warnings = [], list(boq.get("warnings") or [])
-    for fn in (lambda: check_b01(rows, args.tol, F),
-               lambda: check_b02(rows, args.tol, F, warnings),
-               lambda: check_keys(rows, args.outlier_pct, F)):
+    for cname, fn in (("B01 산술", lambda: check_b01(rows, args.tol, F)),
+                      ("B02 소계/합계", lambda: check_b02(rows, args.tol, F, warnings)),
+                      ("B03~B05 단위·중복·단가", lambda: check_keys(rows, args.outlier_pct, F)),
+                      ("연쇄 판정", lambda: tag_cascades(F, args.tol))):
         try:
             fn()
         except Exception as e:  # noqa: BLE001 - 한 검사가 실패해도 나머지 진행
-            warnings.append(f"검사 중 오류: {e!r}")
+            warnings.append(f"검사 중 오류({cname}): {e!r}")
+            F.append(make_finding(
+                "E00", "높음", "(검사 전체)", f"검사 실패: {cname} — 결과 신뢰 불가",
+                f"{type(e).__name__}: {e}",
+                "입력 JSON(extract_boq.py 출력)을 확인하고 해당 검사를 수동으로 수행"))
+    for f in F:
+        f.pop("_meta", None)
     st = boq.get("stats") or {}
     if st.get("scanned_pages"):
         warnings.append(f"스캔 페이지 {st['scanned_pages']} 는 자동 검사에서 제외됨 — 이미지 판독 필요")

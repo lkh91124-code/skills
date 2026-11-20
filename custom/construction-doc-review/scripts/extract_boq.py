@@ -14,6 +14,8 @@
  - gids   : 해당 행이 속한 공종 그룹 id 목록(상위→하위)
  - closes : subtotal 이 닫는 그룹 id (추정)
  - scope  : 소계 비교 후보 그룹 id 목록 (가장 하위부터). total 은 ["*"]
+PDF 에 표 괘선이 없으면 단어 좌표(헤더 단어 위치로 열 범위 추정) 기반으로 추출하고 저신뢰로 표시한다.
+이때 --header-row 는 페이지의 n번째 텍스트 줄을 뜻한다.
 원본 파일은 읽기만 하며 절대 수정하지 않는다.
 """
 
@@ -32,6 +34,8 @@ NUM_FIELDS = ["qty", "mat_up", "mat_amt", "lab_up", "lab_amt",
               "exp_up", "exp_amt", "tot_up", "tot_amt"]
 MONEY_FIELDS = NUM_FIELDS[1:]
 HEADER_SCAN_ROWS = 15
+# 합계 열 헤더(단가/금액 접미어를 뗀 기본형). 부분일치 대신 명시 목록으로만 판단 ("조합" 등 오탐 방지)
+_TOT_HEADER_BASES = {"합계", "합", "계", "총계", "총액", "합계액", "총합계", "총금액", "합산"}
 SCANNED_TEXT_MIN = 30  # 페이지 텍스트가 이보다 적으면 스캔(이미지) 페이지로 간주
 
 
@@ -59,7 +63,8 @@ def header_field(label: str):
     """정규화된 헤더 라벨 → 필드명. 해당 없으면 None."""
     if not label:
         return None
-    if label in ("no", "번호", "순번", "항번", "코드", "호표", "일련번호") or label.startswith("코드"):
+    # "품목코드"/"공종코드" 처럼 '코드'가 들어간 헤더는 품명 키워드(품목·공종)보다 먼저 code 로
+    if label in ("no", "번호", "순번", "항번", "호표", "일련번호") or "코드" in label:
         return "code"
     if any(k in label for k in ("품명", "공종", "명칭", "품목", "공사명", "항목")):
         return "name"
@@ -78,8 +83,17 @@ def header_field(label: str):
         grp = "lab"
     elif "경비" in label:
         grp = "exp"
-    elif any(k in label for k in ("합계", "총액", "합")) or label in ("계", "계단가", "계금액"):
-        grp = "tot"
+    else:
+        # '합'/'계' 부분일치는 "조합", "설계" 등을 잘못 잡으므로 단가/금액 접미어를 뗀 기본형을 명시 비교
+        base = label
+        for suf in ("단가", "금액"):
+            if base.endswith(suf) and len(base) > len(suf):
+                base = base[: -len(suf)]
+                break
+        if base.startswith("금액") and base != "금액":  # "금액계", "금액합계"
+            base = base[2:]
+        if base in _TOT_HEADER_BASES:
+            grp = "tot"
     sub = None
     if "단가" in label:
         sub = "up"
@@ -206,35 +220,60 @@ def bare_name(name: str) -> str:
 
 
 class Hierarchy:
-    """공종 그룹 스택. 번호 체계 스타일이 이미 스택에 있으면 그 수준으로 되돌아간다."""
+    """공종 그룹 스택. 번호 체계 스타일이 이미 스택에 있으면 그 수준으로 되돌아간다.
+
+    번호 없는(plain) 그룹은 같은 스타일끼리 서로 교체되므로, 상위 그룹이 스택에서 밀려날 수 있다.
+    그래서 구간(segment) 안에서 열린 모든 그룹을 history 에 남겨 두고, "X 계"/"X 소계" 가 나오면
+    스택에 X 가 없을 때 history 에서 X 를 찾아 그 그룹 행부터 소계 행까지를 범위로 삼는다.
+    """
 
     def __init__(self):
-        self.stack = []  # [(style, gid, name)]
+        self.stack = []    # [(style, gid, name)]
+        self.history = []  # [(gid, name, row_idx)] — 현재 구간에서 열린 모든 그룹
         self.next_gid = 1
 
-    def reset(self):
+    def reset(self, clear_history=False):
         self.stack = []
+        if clear_history:
+            self.history = []
 
-    def push_group(self, name, style):
+    def push_group(self, name, style, row_idx=None):
         styles = [s for s, _, _ in self.stack]
         if style in styles:
             del self.stack[styles.index(style):]
         gid = self.next_gid
         self.next_gid += 1
         self.stack.append((style, gid, cell_text(name)))
+        self.history.append((gid, cell_text(name), row_idx))
         return gid
 
     def close_for_subtotal(self, label):
-        """소계가 닫는 그룹을 추정하고 스택에서 제거. 반환 (closes, scope, 닫힌 그룹의 경로)."""
-        if not self.stack:
-            return None, [], []
+        """소계가 닫는 그룹을 추정하고 스택에서 제거.
+
+        반환 (closes, scope, 닫힌 그룹의 경로, 소급 범위 시작 row_idx 또는 None).
+        소급 범위가 있으면 호출자가 그 그룹 행 이후의 항목들에 closes gid 를 덧붙인다.
+        """
         lab = hnorm(label)
-        idx = len(self.stack) - 1
+        # 1) 스택에서 이름이 일치하는 그룹
         for i in range(len(self.stack) - 1, -1, -1):
             b = bare_name(self.stack[i][2])
             if b and b in lab:
-                idx = i
-                break
+                return self._close_stack(i) + (None,)
+        # 2) 스택에는 없지만(같은 스타일 그룹에 밀려남) 이 구간에서 열렸던 그룹
+        for gid, name, row_idx in reversed(self.history):
+            b = bare_name(name)
+            if b and b in lab and row_idx is not None:
+                # X 이후에 열린 그룹(=X 의 하위로 봄)은 함께 닫는다
+                self.stack = [e for e in self.stack if e[1] < gid]
+                scope = [gid] + [g for _, g, _ in reversed(self.stack)]
+                closed_path = [n for _, _, n in self.stack] + [name]
+                return gid, scope, closed_path, row_idx
+        # 3) 이름 없는 "소계"/"계": 가장 안쪽 그룹
+        if not self.stack:
+            return None, [], [], None
+        return self._close_stack(len(self.stack) - 1) + (None,)
+
+    def _close_stack(self, idx):
         scope = [g for _, g, _ in reversed(self.stack[: idx + 1])]
         closes = self.stack[idx][1]
         closed_path = [n for _, _, n in self.stack[: idx + 1]]
@@ -260,7 +299,7 @@ class RowBuilder:
         self.h = Hierarchy()
 
     def new_segment(self):
-        self.h.reset()
+        self.h.reset(clear_history=True)
 
     def add(self, cells, cmap, loc, segment, indent=0, header_labels=None,
             text_strategy=False):
@@ -321,14 +360,20 @@ class RowBuilder:
             row["level"] = 0
             self.h.reset()
         elif kind == "subtotal":
-            closes, scope, closed_path = self.h.close_for_subtotal(label)
+            closes, scope, closed_path, from_idx = self.h.close_for_subtotal(label)
+            if from_idx is not None:
+                # 밀려난 상위 그룹 X 의 "X 계": 그룹 행 이후 같은 구간의 항목·하위 그룹을 X 소속으로 소급
+                for r in self.rows[from_idx + 1:]:
+                    if r["segment"] == segment and r["type"] in ("item", "group") \
+                            and closes not in r["gids"]:
+                        r["gids"] = sorted(r["gids"] + [closes])
             # path = 닫힌 공종의 경로. closes 가 None 이면 '직전 소계 이후 항목'과 비교
             row.update(type="subtotal", closes=closes, scope=scope,
                        level=max(len(closed_path), 1), path=closed_path)
         elif name and not unit and vals["qty"] is None and not any(
                 vals[f] is not None for f in ("mat_up", "lab_up", "exp_up", "tot_up")):
             style = numbering_style(raw_name, indent)
-            gid = self.h.push_group(name, style)
+            gid = self.h.push_group(name, style, row_idx=len(self.rows))
             row.update(type="group", level=len(self.h.stack), path=self.h.path[:-1],
                        gids=self.h.gids)
             row["gid"] = gid
@@ -471,6 +516,156 @@ def parse_pages(spec, n):
     return sorted(p for p in pages if 1 <= p <= n)
 
 
+# --- 괘선 없는 PDF: 단어 좌표 기반 추출 -------------------------------------
+_PAGE_NO_RES = [re.compile(r"^[-–—\s]*\d+[-–—\s]*$"),        # "3", "- 3 -", "–3–"
+                re.compile(r"^\d+\s*/\s*\d+$"),                 # "1/3"
+                re.compile(r"^(?:page|p\.)\s*\d+(?:\s*/\s*\d+)?$", re.I),
+                re.compile(r"^\d+\s*쪽$|^\d+\s*페이지$")]
+
+
+def _is_page_number(text, top, height):
+    t = unicodedata.normalize("NFKC", text).strip()
+    if not any(r.match(t) for r in _PAGE_NO_RES):
+        return False
+    if re.search(r"[-–—/]|쪽|페이지|page|p\.", t, re.I):
+        return True  # 장식이 붙은 쪽번호는 위치와 무관하게 제거
+    return top < height * 0.1 or top > height * 0.88  # 숫자만 있으면 위·아래 여백에 있을 때만
+
+
+def _group_lines(words, tol=3.0):
+    """단어들을 top 좌표 기준으로 줄 단위로 묶는다 (tol 이내면 같은 줄)."""
+    lines = []
+    for w in sorted(words, key=lambda w: (w["top"], w["x0"])):
+        if lines and abs(w["top"] - lines[-1]["top"]) <= tol:
+            lines[-1]["words"].append(w)
+        else:
+            lines.append({"top": w["top"], "words": [w]})
+    for ln in lines:
+        ln["words"].sort(key=lambda w: w["x0"])
+        ln["text"] = " ".join(w["text"] for w in ln["words"])
+        ln["bottom"] = max(w["bottom"] for w in ln["words"])
+    return lines
+
+
+def _merge_label_words(words):
+    """헤더 줄의 단어를 열 라벨로 병합. "품 명"처럼 글자 사이가 벌어진 라벨은 붙이되,
+    각각 독립 헤더인 인접 라벨("단위" "수량")은 붙이지 않는다."""
+    out = []
+    for w in words:
+        if out:
+            prev = out[-1]
+            gap = w["x0"] - prev["x1"]
+            h = max(w["bottom"] - w["top"], 6)
+            lone = header_field(hnorm(prev["text"])) is None or header_field(hnorm(w["text"])) is None
+            if gap <= h * 1.3 and lone and not (prev["text"] in ("단가", "금액") and
+                                                w["text"] in ("단가", "금액")):
+                prev["text"] += w["text"]
+                prev["x1"] = w["x1"]
+                continue
+        out.append({"text": w["text"], "x0": w["x0"], "x1": w["x1"]})
+    return out
+
+
+def _layout_from_header(line, next_line):
+    """헤더 줄(필요하면 단가/금액 하위 줄 포함) → 열 배치 [{label, x0, x1, cx}] 와 하위줄 사용 여부."""
+    tops = _merge_label_words(line["words"])
+    subs = []
+    if next_line is not None:
+        cand = _merge_label_words(next_line["words"])
+        if sum(1 for c in cand if hnorm(c["text"]) in ("단가", "금액")) >= 2:
+            subs = cand
+    cols = []
+    if subs:
+        grp_tops = [t for t in tops if (header_field(hnorm(t["text"])) or "").split("_")[0]
+                    in ("mat", "lab", "exp", "tot")]
+        used = set()
+        for sbw in subs:
+            cx = (sbw["x0"] + sbw["x1"]) / 2
+            if not grp_tops:
+                break
+            t = min(grp_tops, key=lambda t: abs((t["x0"] + t["x1"]) / 2 - cx))
+            used.add(id(t))
+            cols.append({"label": t["text"] + sbw["text"], "x0": sbw["x0"], "x1": sbw["x1"]})
+        cols += [{"label": t["text"], "x0": t["x0"], "x1": t["x1"]} for t in tops if id(t) not in used]
+    else:
+        cols = [{"label": t["text"], "x0": t["x0"], "x1": t["x1"]} for t in tops]
+    cols.sort(key=lambda c: c["x0"])
+    for c in cols:
+        c["cx"] = (c["x0"] + c["x1"]) / 2
+    cmap = {}
+    for i, c in enumerate(cols):
+        f = header_field(hnorm(c["label"]))
+        if f and f not in cmap:
+            cmap[f] = i
+    return cols, cmap, bool(subs)
+
+
+def _words_to_cells(words, cols):
+    """한 줄의 단어를 열에 배정. 숫자는 헤더 중심 사이 중간점 기준(우측정렬 대응),
+    글자는 왼쪽 시작점 기준(긴 품명이 오른쪽 열로 넘치는 것 방지)."""
+    n = len(cols)
+    num_bounds = [(cols[i - 1]["cx"] + cols[i]["cx"]) / 2 for i in range(1, n)]
+    txt_bounds = [cols[i]["x0"] - 0.25 * max(cols[i]["x0"] - cols[i - 1]["x1"], 0) for i in range(1, n)]
+    buckets = [[] for _ in range(n)]
+    for w in words:
+        if parse_num(w["text"])[0] is not None:
+            x, bounds = (w["x0"] + w["x1"]) / 2, num_bounds
+        else:
+            x, bounds = w["x0"], txt_bounds
+        i = 0
+        while i < n - 1 and x >= bounds[i]:
+            i += 1
+        buckets[i].append(w["text"])
+    return [" ".join(b) if b else None for b in buckets]
+
+
+def pdf_word_rows(page, pno, state, header_row, warnings):
+    """괘선 없는 페이지를 단어 좌표로 표 행 목록 [(줄번호, cells)] 으로 만든다.
+
+    state: 페이지 간 공유 {"cols", "cmap", "titles"}. 헤더를 못 찾고 이전 배치도 없으면 None.
+    """
+    words = page.extract_words(keep_blank_chars=False, use_text_flow=False) or []
+    if not words:
+        return None
+    lines = _group_lines(words)
+    hidx = None
+    if header_row and state.get("cols") is None and 1 <= header_row <= len(lines):
+        hidx = header_row - 1  # --header-row: PDF 에서는 페이지의 n번째 텍스트 줄
+    else:
+        for i, ln in enumerate(lines[:40]):
+            labels = [m["text"] for m in _merge_label_words(ln["words"])]
+            if is_header_row(labels):
+                hidx = i
+                break
+    start = 0
+    if hidx is not None:
+        nxt = lines[hidx + 1] if hidx + 1 < len(lines) else None
+        cols, cmap, used_sub = _layout_from_header(lines[hidx], nxt)
+        if "name" in cmap:
+            state["cols"], state["cmap"] = cols, cmap
+            for ln in lines[:hidx]:  # 헤더 위 줄(표제·공사명)은 페이지마다 반복되는 제목으로 기억
+                state.setdefault("titles", set()).add(hnorm(ln["text"]))
+            start = hidx + (2 if used_sub else 1)
+        elif state.get("cols") is None:
+            return None
+    elif state.get("cols") is None:
+        return None
+    cols, cmap = state["cols"], state["cmap"]
+    titles = state.get("titles") or set()
+    out = []
+    for li in range(start, len(lines)):
+        ln = lines[li]
+        if _is_page_number(ln["text"], ln["top"], page.height):
+            continue
+        if hnorm(ln["text"]) in titles:
+            continue  # 반복 표제
+        labels = [m["text"] for m in _merge_label_words(ln["words"])]
+        if is_header_row(labels) or is_subheader_row(labels):
+            continue  # 반복 헤더
+        out.append((li + 1, _words_to_cells(ln["words"], cols)))
+    return out, cmap
+
+
 def extract_pdf(path, pages_spec, header_row, warnings, builder):
     try:
         import pdfplumber
@@ -483,6 +678,9 @@ def extract_pdf(path, pages_spec, header_row, warnings, builder):
         sys.exit(f"오류: PDF 를 열 수 없습니다: {e}")
 
     cmap, ncols = None, None
+    wstate = {}                     # 단어 좌표 모드의 페이지 간 열 배치
+    word_mode_used = False
+    warn_word_pages = []
     builder.new_segment()
     with pdf:
         try:
@@ -500,6 +698,27 @@ def extract_pdf(path, pages_spec, header_row, warnings, builder):
                                           "horizontal_strategy": "lines"}) or []
             tables = [t for t in tables if len(t) >= 2 and max(len(r) for r in t) >= 4]
             if not tables:
+                # 1차 대안: 단어 좌표 기반 (헤더 단어 위치로 열 범위를 잡음)
+                try:
+                    res = pdf_word_rows(page, pno, wstate, header_row, warnings)
+                except Exception as e:  # noqa: BLE001
+                    warnings.append(f"{pno}페이지: 단어 좌표 기반 추출 실패: {e!r}")
+                    res = None
+                if res is not None:
+                    wrows, wmap = res
+                    word_mode_used = True
+                    warn_word_pages.append(pno)
+                    for line_no, cells in wrows:
+                        before = len(builder.rows)
+                        try:
+                            builder.add(cells, wmap, {"page": pno, "row": line_no, "mode": "words"},
+                                        segment="pdf", text_strategy=True)
+                        except Exception as e:  # noqa: BLE001
+                            warnings.append(f"{pno}페이지 {line_no}번째 줄 처리 오류: {e}")
+                            continue
+                        if len(builder.rows) > before:
+                            builder.rows[-1]["low_confidence"] = True
+                    continue
                 strategy = "text"
                 tables = page.extract_tables({"vertical_strategy": "text",
                                               "horizontal_strategy": "text"}) or []
@@ -537,9 +756,13 @@ def extract_pdf(path, pages_spec, header_row, warnings, builder):
                         continue
                     if (strategy == "text" or width != ncols) and len(builder.rows) > before:
                         builder.rows[-1]["low_confidence"] = True
-    if cmap is None and not scanned:
+    if warn_word_pages:
+        warnings.append(f"표 괘선이 없어 단어 좌표 기반으로 추출한 페이지: {warn_word_pages} "
+                        "— 열 배정이 틀릴 수 있으므로 지적 행은 원본 대조 필요 (저신뢰)")
+    if cmap is None and not word_mode_used and not scanned:
         sys.exit("오류: PDF 에서 내역서 헤더(공종/품명, 단위, 수량)를 찾지 못했습니다. "
-                 "--pages 로 내역 페이지를 지정하세요.")
+                 "--pages 로 내역 페이지를, --header-row 로 헤더 행 번호(괘선 없는 PDF 는 "
+                 "페이지의 n번째 텍스트 줄)를 지정하세요.")
     if scanned:
         warnings.append(f"스캔(이미지) 페이지로 보이는 쪽: {scanned} — pdftoppm 으로 이미지화하여 육안 판독 필요")
     return scanned
@@ -547,6 +770,11 @@ def extract_pdf(path, pages_spec, header_row, warnings, builder):
 
 # ---------------------------------------------------------------------------
 def main():
+    for st in (sys.stdout, sys.stderr):
+        try:
+            st.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            pass
     ap = argparse.ArgumentParser(description="내역서(BOQ) xlsx/PDF 를 표준 JSON 으로 추출")
     ap.add_argument("file", help="내역서 파일 (.xlsx/.xlsm/.pdf)")
     ap.add_argument("--sheet", help="엑셀 시트 이름 (미지정 시 헤더가 있는 모든 시트)")
